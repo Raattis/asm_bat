@@ -79,18 +79,38 @@ if not exist %compiler_executable% (
 	echo Tiny C Compiler Acquired!
 )
 
+set no_exe=0
+set output_arg=-o%~n0.exe
+if %no_exe% == 1 (
+	set output_arg=-run
+	echo using -run
+)
+
+rem Double-clicking on a .bat file includes a space between the two final "-marks
+echo %CMDCMDLINE% | findstr /R /C:"bat[""]..."
+set dont_pause_after_error=%errorlevel%
+
 (
 	echo static const char* b_source_filename = "%~n0%~x0";
 	echo #line 0 "%~n0%~x0"
 	echo #if GOTO_BOOTSTRAP_BUILDER
 	type %~n0%~x0
-) | %compiler_executable% -run -DSHARED_PREFIX -DSOURCE -bench -Itcc/libtcc -lmsvcrt -lkernel32 -luser32 -lgdi32 -Ltcc/libtcc -llibtcc -
-rem ) | %compiler_executable% -o%~n0.exe -DSHARED_PREFIX -DSOURCE -bench -Itcc/libtcc -lmsvcrt -lkernel32 -luser32 -lgdi32 -Ltcc/libtcc -llibtcc -
+) | %compiler_executable% %output_arg% -DSHARED_PREFIX -DSOURCE -bench -Itcc/libtcc -lmsvcrt -lkernel32 -luser32 -lgdi32 -Ltcc/libtcc -llibtcc -
+rem ) | %compiler_executable% -run -DSHARED_PREFIX -DSOURCE -bench -Itcc/libtcc -lmsvcrt -lkernel32 -luser32 -lgdi32 -Ltcc/libtcc -llibtcc -
 rem ) | %compiler_executable% -run -nostdinc -lmsvcrt -lkernel32 -luser32 -lgdi32 -Itcc/include -Itcc/include/winapi -Itcc/libtcc -Ltcc/libtcc -llibtcc -DSHARED_PREFIX -DSOURCE -bench -
 
+if %no_exe% == 1 (
+	goto error_check
+)
+
+if %errorlevel% == 0 (
+	echo starting exe
+	%~n0.exe
+)
 
 echo.
 
+:error_check
 if %errorlevel% == 0 (
 	echo Finished without errors!
 ) else (
@@ -107,10 +127,12 @@ if %errorlevel% == 0 (
 			)
 		)
 	)
+	
+	if %dont_pause_after_error% == 0 (
+		pause
+	)
 	goto end
 )
-
-%~n0.exe
 
 :end
 exit errorlevel
@@ -132,7 +154,7 @@ enum { TRACE=1, TRACE_VERBOSE=0 };
 #define verbose_func() verbose_printf("%s, ", __FUNCTION__)
 #define verbose_func_end() verbose_printf("%s end, ", __FUNCTION__)
 
-#define FATAL(x, ...) do { if (x) break; fprintf(stderr, "%s:%d: (" SEGMENT_NAME "/%s) FATAL: ", __FILE__, __LINE__, __FUNCTION__); fprintf(stderr, __VA_ARGS__ ); fprintf(stderr, "\n(%s)\n", #x); int system(const char*); system("pause"); void exit(int); exit(-54746); } while(0)
+#define FATAL(x, ...) do { if (x) break; fprintf(stderr, "%s:%d: (" SEGMENT_NAME "/%s) FATAL: ", __FILE__, __LINE__, __FUNCTION__); fprintf(stderr, __VA_ARGS__ ); fprintf(stderr, "\n(%s)\n", #x); int system(const char*); void exit(int); exit(-444); } while(0)
 
 typedef struct
 {
@@ -176,11 +198,12 @@ struct Symbols
 {
 	void* address[1024];
 	const char* name[1024];
+	int size[1024];
 	int count;
 };
 #define PUSH(p_symbols, p_name, p_address) do { struct Symbols* __symbols = (p_symbols); int i = __symbols->count++; __symbols->address[i] = (p_address); __symbols->name[i] = (p_name); } while(0)
 
-struct Symbols g_functions;
+struct Symbols g_functions = {0};
 
 struct Scope
 {
@@ -190,6 +213,17 @@ struct Scope
 	struct Symbols symbols;
 } g_globals = {.pc = (void*)-1, .rbp = (void*)-1, nullptr, {0}}, *g_current_scope = &g_globals;
 
+
+void* g_stack = (void*)-1; // Beginning of stack
+void* g_offset = (void*)-1; // Beginning of the first debuggable function in code
+
+typedef unsigned short u16;
+#define MAX_PROGRAM_SIZE (4096)
+#define CHUNK_SIZE (8)
+struct ReverseMapping
+{
+	u16 functionSymbols[MAX_PROGRAM_SIZE / CHUNK_SIZE];
+} g_reverseMapping = {0};
 
 #define STRINGIFY2(x) #x 
 #define STRINGIFY(x) STRINGIFY2(x)
@@ -214,12 +248,14 @@ struct Scope
 	#define GET_STACK_POINTER(p_rsp) asm volatile ("movq %%rsp, %0;" : "=r" (p_rsp))
 #endif
 
+
+
 const char* findFunctionName(void* pc)
 {
 	if (pc < g_functions.address[0])
 		return "<BELOW ADDRESS SPACE>";
 
-	if (pc > g_functions.address[g_functions.count - 1] + 1024)
+	if (pc > g_functions.address[g_functions.count - 1] + g_functions.size[g_functions.count - 1])
 		return "<ABOVE ADDRESS SPACE>";
 
 	for (int i = 1; i < g_functions.count; ++i)
@@ -230,25 +266,40 @@ const char* findFunctionName(void* pc)
 	return g_functions.name[g_functions.count - 1];
 }
 
-void* g_stack = (void*)-1;
-void* g_offset = (void*)-1; // Beginning of the first debuggable function
-
-void printStack(void** ras)
+int getFunctionSymbolIndex(void* pc)
 {
-	for (int i = -5; i < 5; ++i)
+	long long offset = pc - g_offset;
+	if (offset < 0 || offset >= MAX_PROGRAM_SIZE)
+		return -1;
+	return g_reverseMapping.functionSymbols[offset / CHUNK_SIZE];
+}
+
+void populateFunctionReverseMapping(void* start, void* pc)
+{
+	int functionSymbolIndex = getFunctionSymbolIndex(start);
+	if (functionSymbolIndex < 0 || pc < start || g_offset + MAX_PROGRAM_SIZE < pc)
+		return;
+
+	u16 val = (u16)functionSymbolIndex;
+	FATAL(val < g_functions.count, "%d<%d", val, g_functions.count);
+
+	int min = (start - g_offset) / CHUNK_SIZE;
+	int length = (pc - start + CHUNK_SIZE - 1) / CHUNK_SIZE;
+	for (int i = min + length; i > min && g_reverseMapping.functionSymbols[i] != val; --i)
 	{
-		printf("  %s(%4X)\n", findFunctionName(ras[i]), ras[i] - g_offset);
+		FATAL(g_reverseMapping.functionSymbols[i] == 0, "%d != %d, double write. Writing %s %s", g_reverseMapping.functionSymbols[i], val, g_functions.name[g_reverseMapping.functionSymbols[i]], g_functions.name[functionSymbolIndex]);
+		g_reverseMapping.functionSymbols[i] = val;
 	}
 }
 
 #define PRINT_REGISTERS() do {\
-    void* pc; \
+	void* pc; \
 	void* rbp; \
 	void* rsp; \
 	GET_PC(pc); \
 	GET_RETURN_ADDRESS(rbp); \
 	GET_STACK_POINTER(rsp); \
-    printf("%s(%d)%s: PC=%X, rbp=%X, rsp=%X\n", __FILE__, __LINE__, __FUNCTION__, pc - g_offset, g_stack - rbp, g_stack - rsp); \
+	printf("%s:%d: %s(): PC=%X, rbp=%X, rsp=%X\n", __FILE__, __LINE__, __FUNCTION__, pc - g_offset, g_stack - rbp, g_stack - rsp); \
 	/*printStack(ras);*/ \
 } while(0)
 
@@ -268,7 +319,7 @@ void printCallstack(void)
 	GET_BASE_POINTER(rbp);
 	while (rbp <= g_stack) {
 		void* ret = rbp[1];
-		printf("  %s (%X)\n", findFunctionName(ret), ret - g_offset);
+		printf(" %4X %s()\n", ret - g_offset, findFunctionName(ret));
 		rbp = (void**)rbp[0];
 	}
 }
@@ -283,60 +334,10 @@ void ccc()
 	GET_RETURN_ADDRESS(rsp);
 
 	printCallstack();
-
-	void** caller_rbp = (void**)rbp[0];
-	void* ret = rbp[1];
-
-	void** ccaller_rbp = (void**)caller_rbp[0];
-	void* caller_ret = caller_rbp[1];
-
-	void** cccaller_rbp = (void**)ccaller_rbp[0];
-	void* ccaller_ret = ccaller_rbp[1];
-
-	void** ccccaller_rbp = (void**)cccaller_rbp[0];
-	void* cccaller_ret = cccaller_rbp[1];
-
-
-	printf(">>>>>>>>>>>>> %p\n", g_stack - caller_rbp);
-	printf(">>>>>>>>>>>>> %p, %s\n", ret - g_offset, findFunctionName(ret));
-
-	printf(">>>>>>>>>>>>> %p\n", g_stack - ccaller_rbp);
-	printf(">>>>>>>>>>>>> %p, %s\n", caller_ret - g_offset, findFunctionName(caller_ret));
-
-	printf(">>>>>>>>>>>>> %p\n", cccaller_rbp);
-	printf(">>>>>>>>>>>>> %p, %s\n", ccaller_ret - g_offset, findFunctionName(ccaller_ret));
-
-	printf(">>>>>>>>>>>>> %p\n", ccccaller_rbp);
-	printf(">>>>>>>>>>>>> %p, %s\n", cccaller_ret - g_offset, findFunctionName(cccaller_ret));
-	
-	
-	printf("%s %p\n", __FUNCTION__, __FUNCTION__);
-
-	exit(22);
-
-	printf(">>>>>>>>>>>>> %d\n", (char*)&eka - (char*)rbp);
-	printf(">>>>>>>>>>>>> %d\n", *(((int*)rbp)-1));
-	printf(">>>>>>>>>>>>> %d\n", *(((int*)rbp)-2));
-	printf(">>>>>>>>>>>>> %lld\n", *(((long long*)(((int*)rbp)-2)) - 1));
-	printf(">>>>>>>>>>>>> %lld\n", rbp);
-	printf(">>>>>>>>>>>>> my rbp: %X\n", g_stack - rbp);
-	printf(">>>>>>>>>>>>> my rsp: %X\n", g_stack - rsp);
-	printf(">>>>>>>>>>>>> my ret: %X  == %s\n", ret - g_offset, findFunctionName(ret));
-	printf(">>>>>>>>>>>>> caller rsp: %X\n",  g_stack - (rbp + 2));
-	printf(">>>>>>>>>>>>> caller rsp: %X\n",  g_stack - (rbp + 4));
-	printf(">>>>>>>>>>>>> caller rsp: %X\n",  g_stack - (rbp + 6));
-	printf(">>>>>>>>>>>>> caller rsp: %X\n",  g_stack - (rbp + 8));
-	printf(">>>>>>>>>>>>> caller rsp: %X\n",  g_stack - (rbp + 16));
-	printf(">>>>>>>>>>>>> caller rsp: %X\n",  (rbp + 16));
-	exit(1);
-	
-	unsigned char i[10] = {1,2,3,4,5,6,7,8,9};
-	PRINT_LOCATION();
-	int j[1024] = {0};
-	//PRINT_LOCATION();
 }
 
-void bbb() {
+void bbb()
+{
 	printf("%s %p\n", __FUNCTION__, __FUNCTION__);
 
 	PRINT_LOCATION();
@@ -345,7 +346,8 @@ void bbb() {
 	ccc();
 }
 
-void aaa() {
+void aaa()
+{
 	printf("%s %p\n", __FUNCTION__, __FUNCTION__);
 
 	PRINT_LOCATION();
@@ -355,6 +357,14 @@ void aaa() {
 	ccc();
 	bbb();
 	ccc();
+}
+
+LONG exception_handler(LPEXCEPTION_POINTERS p)
+{ 
+	printCallstack();
+	FATAL(0, "Exception!!!\n");
+	exit(123);
+	return EXCEPTION_EXECUTE_HANDLER;
 }
 
 void run()
@@ -366,7 +376,7 @@ void run()
 
 	trace_printf("_start()\n");
 
-	//SetUnhandledExceptionFilter((LPTOP_LEVEL_EXCEPTION_FILTER)&exception_handler);
+	SetUnhandledExceptionFilter((LPTOP_LEVEL_EXCEPTION_FILTER)&exception_handler);
 
 	PRINT_LOCATION();
 
@@ -379,12 +389,6 @@ void run()
 	exit(69);
 }
 
-//LONG exception_handler(LPEXCEPTION_POINTERS p)
-//{
-//	FATAL(0, "Exception!!!\n");
-//	return EXCEPTION_EXECUTE_HANDLER;
-//}
-
 void _start()
 {
 	run();
@@ -394,6 +398,7 @@ void _runmain() { run(); }
 
 void initDebugger()
 {
+	g_functions.count += 1; // Leave the first as empty
 	ADD_FUNCTION(initDebugger);
 	ADD_FUNCTION(run);
 	ADD_FUNCTION(aaa);
@@ -402,9 +407,10 @@ void initDebugger()
 	ADD_FUNCTION(_start);
 	ADD_FUNCTION(_runmain);
 	ADD_FUNCTION(printCallstack);
+	ADD_FUNCTION(exception_handler);
 
 	// bubble sort for the ultimate performance
-	for (int i = 0; i < g_functions.count; ++i)
+	for (int i = 1; i < g_functions.count; ++i)
 	{
 		for (int j = i+1; j < g_functions.count; ++j)
 		{
